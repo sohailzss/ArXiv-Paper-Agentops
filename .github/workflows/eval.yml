@@ -37,7 +37,7 @@ jobs:
     timeout-minutes: 60
     environment: production
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: astral-sh/setup-uv@v6
         with:
@@ -49,7 +49,7 @@ jobs:
 
       - name: Run evaluation with gate
         env:
-          EVAL_BASE_URL: http://${{ vars.EC2_HOST }}
+          EVAL_BASE_URL: http://${{ vars.EC2_HOST || secrets.EC2_HOST }}
           EVAL_AUTH: arxiv:${{ secrets.UI_PASSWORD }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}  # DeepEval judge
           DEEPEVAL_TELEMETRY_OPT_OUT: "1"

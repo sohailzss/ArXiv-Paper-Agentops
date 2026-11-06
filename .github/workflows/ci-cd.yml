@@ -35,7 +35,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: astral-sh/setup-uv@v6
         with:
@@ -67,7 +67,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Detect Airflow changes
         uses: dorny/paths-filter@v3
@@ -118,12 +118,13 @@ jobs:
       group: deploy-production
       cancel-in-progress: false  # never interrupt a deploy halfway
     env:
-      EC2_HOST: ${{ vars.EC2_HOST }}
+      # Read as a variable, or as a secret of the same name if it was added there instead.
+      EC2_HOST: ${{ vars.EC2_HOST || secrets.EC2_HOST }}
       EC2_USER: ubuntu
       APP_DIR: /home/ubuntu/arxiv-rag
-      SG_ID: ${{ vars.EC2_SECURITY_GROUP_ID }}
+      SG_ID: ${{ vars.EC2_SECURITY_GROUP_ID || secrets.EC2_SECURITY_GROUP_ID }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Check required secrets are set
         env:
@@ -141,13 +142,16 @@ jobs:
           UI_PASSWORD: ${{ secrets.UI_PASSWORD }}
         run: |
           missing=()
-          for name in EC2_HOST SG_ID EC2_SSH_KEY AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY POSTGRES_DATABASE_URL \
+          # Variables (Settings -> Environments -> production -> Environment variables, NOT secrets)
+          [ -n "$EC2_HOST" ] || missing+=("EC2_HOST (variable)")
+          [ -n "$SG_ID" ] || missing+=("EC2_SECURITY_GROUP_ID (variable)")
+          for name in EC2_SSH_KEY AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY POSTGRES_DATABASE_URL \
                       OPENAI_API_KEY LANGFUSE_PUBLIC_KEY LANGFUSE_SECRET_KEY LOGFIRE__TOKEN GUARDRAILS__ID \
                       AIRFLOW_ADMIN_PASSWORD AIRFLOW_JWT_SECRET UI_PASSWORD; do
-            [ -n "${!name}" ] || missing+=("$name")
+            [ -n "${!name}" ] || missing+=("$name (secret)")
           done
           if [ ${#missing[@]} -gt 0 ]; then
-            echo "::error::Missing secrets/variables: ${missing[*]} (Settings -> Environments -> production)"
+            echo "::error::Missing in Settings -> Environments -> production: ${missing[*]}"
             exit 1
           fi
           echo "All required secrets are set."
