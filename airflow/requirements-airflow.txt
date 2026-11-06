@@ -1,0 +1,7 @@
+# Installed into the Airflow image next to a pinned apache-airflow, so pip keeps Airflow's versions.
+# torch/torchvision (CPU) are installed separately in the Dockerfile first.
+docling>=2.40
+pydantic-settings>=2.8
+psycopg2-binary>=2.9.10
+httpx>=0.28
+opensearch-py>=3.0

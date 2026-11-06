@@ -1,0 +1,157 @@
+name: agentic-rag-arxiv
+
+services:
+  # FastAPI application
+  api:
+    build: .
+    container_name: rag-api
+    # Public DNS for outside lookups (Neon, arXiv). Some ISP/router DNS servers fail on
+    # *.neon.tech; service names like airflow-db still resolve via Docker's internal DNS.
+    dns: [8.8.8.8, 1.1.1.1]
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      # Inside Docker, reach OpenSearch and Redis by their service names, not localhost.
+      - OPENSEARCH__HOST=http://opensearch:9200
+      - REDIS__URL=redis://redis:6379/0
+    depends_on:
+      opensearch:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/ping')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    networks: [rag-network]
+
+  # OpenSearch: BM25 + vector search (used from Phase 3)
+  opensearch:
+    image: opensearchproject/opensearch:2.19.5
+    container_name: rag-opensearch
+    environment:
+      - discovery.type=single-node
+      - OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m
+      - DISABLE_SECURITY_PLUGIN=true   # local development only
+      - DISABLE_INSTALL_DEMO_CONFIG=true
+      - bootstrap.memory_lock=true
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+      nofile: { soft: 65536, hard: 65536 }
+    ports:
+      - "9200:9200"
+    volumes:
+      - opensearch_data:/usr/share/opensearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    restart: unless-stopped
+    networks: [rag-network]
+
+  # Redis: caches RAG answers (Phase 6). Memory-capped, evicts least-recently-used keys,
+  # no persistence: a cache can always be rebuilt.
+  redis:
+    image: redis:7.4-alpine
+    container_name: rag-redis
+    command: ["redis-server", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+    networks: [rag-network]
+
+  # OpenSearch Dashboards: browse indexes and run queries in Dev Tools
+  opensearch-dashboards:
+    image: opensearchproject/opensearch-dashboards:2.19.5
+    container_name: rag-dashboards
+    environment:
+      - OPENSEARCH_HOSTS=["http://opensearch:9200"]
+      - DISABLE_SECURITY_DASHBOARDS_PLUGIN=true
+    ports:
+      - "5601:5601"
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    restart: unless-stopped
+    networks: [rag-network]
+
+  # Small local Postgres just for Airflow's own metadata (your papers live in Neon).
+  airflow-db:
+    image: postgres:16-alpine
+    container_name: rag-airflow-db
+    environment:
+      - POSTGRES_USER=airflow
+      - POSTGRES_PASSWORD=airflow
+      - POSTGRES_DB=airflow
+    volumes:
+      - airflow_db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks: [rag-network]
+
+  # Airflow 3: runs the daily ingestion DAG (UI on :8080)
+  airflow:
+    build:
+      context: .
+      dockerfile: airflow/Dockerfile
+    container_name: rag-airflow
+    # Public DNS for outside lookups (Neon, arXiv). Some ISP/router DNS servers fail on
+    # *.neon.tech; service names like airflow-db still resolve via Docker's internal DNS.
+    dns: [8.8.8.8, 1.1.1.1]
+    command: ["bash", "/opt/airflow/start.sh"]
+    env_file: .env
+    environment:
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@airflow-db:5432/airflow
+      - AIRFLOW__CORE__EXECUTOR=LocalExecutor
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION=True
+      - AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS=admin:admin
+      - AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_PASSWORDS_FILE=/opt/airflow/passwords.json
+      - AIRFLOW__API_AUTH__JWT_SECRET=${AIRFLOW_JWT_SECRET:-change-me-local-dev-only}
+      - PYTHONPATH=/opt/airflow:/opt/airflow/dags
+      - OPENSEARCH__HOST=http://opensearch:9200
+      - ARXIV__PDF_CACHE_DIR=/opt/airflow/data/arxiv_pdfs
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./src:/opt/airflow/src
+      - ./data:/opt/airflow/data
+      - airflow_logs:/opt/airflow/logs
+    ports:
+      - "8080:8080"
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/api/v2/monitor/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 180s
+    restart: unless-stopped
+    networks: [rag-network]
+
+volumes:
+  opensearch_data:
+  airflow_db_data:
+  airflow_logs:
+
+networks:
+  rag-network:
+    driver: bridge

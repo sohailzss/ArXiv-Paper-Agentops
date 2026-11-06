@@ -1,0 +1,73 @@
+# Production overrides for EC2. Use together with compose.yml:
+#
+#   docker compose -f compose.yml -f compose.prod.yml up -d --build
+#
+# Differences from local dev:
+#   - Only Nginx (port 80, password-protected) is reachable from the internet. Every other port is bound
+#     to 127.0.0.1, so OpenSearch (no security plugin), Redis and Airflow are never exposed.
+#     Reach Airflow with an SSH tunnel:  ssh -L 8080:localhost:8080 ubuntu@<server>
+#   - The Gradio UI runs in a container behind Nginx.
+#   - OpenSearch Dashboards only starts on demand:  docker compose ... --profile tools up -d
+#   - Container logs are size-capped so they can't fill the disk.
+
+x-logging: &logging
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+
+services:
+  api:
+    <<: *logging
+    ports: !override ["127.0.0.1:8000:8000"]
+    environment:
+      - ENVIRONMENT=production
+      - LOGFIRE__ENVIRONMENT=production
+
+  opensearch:
+    <<: *logging
+    ports: !override ["127.0.0.1:9200:9200"]
+
+  opensearch-dashboards:
+    <<: *logging
+    profiles: ["tools"]
+    ports: !override ["127.0.0.1:5601:5601"]
+
+  redis:
+    <<: *logging
+    ports: !override ["127.0.0.1:6379:6379"]
+
+  airflow-db:
+    <<: *logging
+
+  airflow:
+    <<: *logging
+    ports: !override ["127.0.0.1:8080:8080"]
+    environment:
+      - ENVIRONMENT=production
+
+  ui:
+    <<: *logging
+    build:
+      context: .
+      dockerfile: ui/Dockerfile
+    container_name: rag-ui
+    environment:
+      - RAG_API_URL=http://api:8000
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+    networks: [rag-network]
+
+  nginx:
+    <<: *logging
+    image: nginx:1.27-alpine
+    container_name: rag-nginx
+    ports:
+      - "80:80"
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./deploy/.htpasswd:/etc/nginx/.htpasswd:ro
+    depends_on: [api, ui]
+    restart: unless-stopped
+    networks: [rag-network]

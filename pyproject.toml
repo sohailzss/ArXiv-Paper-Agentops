@@ -1,0 +1,59 @@
+[project]
+name = "agentic-rag-arxiv-curator"
+version = "0.1.0"
+description = "Agentic RAG system over arXiv papers (phase-by-phase portfolio build)"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # Phase 1: API + infrastructure clients
+    "fastapi[standard]>=0.115",
+    "pydantic>=2.11",
+    "pydantic-settings>=2.8",
+    "sqlalchemy>=2.0.40",
+    "psycopg2-binary>=2.9.10",
+    "opensearch-py>=3.0",
+    "httpx>=0.28",
+    "boto3>=1.35",
+    "redis>=5.2",
+    "langfuse>=3.0",
+    "langgraph>=0.6",
+    "logfire[fastapi,httpx,psycopg2,redis,sqlalchemy]>=3.0",
+    "deepeval>=4.3",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.25",
+    "ruff>=0.11",
+    "pre-commit>=4.2",
+    "ipykernel>=6.29",
+]
+# Phase 2: heavy PDF parsing deps. Installed only where ingestion runs
+# (Airflow image, or locally with `uv sync --group ingest` for notebooks).
+ingest = [
+    "docling>=2.40",
+]
+ui = [
+    "gradio>=5.0",
+]
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.ruff]
+line-length = 120
+src = ["."]
+exclude = ["notebooks/**", ".venv/**"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["src", "arxiv_ingestion"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+pythonpath = ["."]

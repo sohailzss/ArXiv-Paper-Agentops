@@ -1,0 +1,253 @@
+# CI on every push and pull request; deploy to EC2 on pushes to main once CI passes.
+#
+#   lint-test     ruff + format check + full pytest suite (no network or cloud services needed)
+#   build-images  builds the API and UI images, validates the production compose file,
+#                 and builds the heavy Airflow image only when its files changed
+#   deploy        main only: opens SSH to this runner's IP for the duration of the job, syncs the code,
+#                 renders .env from deploy/production.env + GitHub secrets, rebuilds the stack, waits
+#                 for /health, smoke-tests the public URL, then always closes SSH again
+#
+# Secrets and setup: see the "CI/CD" section of README.md.
+
+name: CI/CD
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:  # manual "Run workflow" button; deploys when run on main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # Cancel superseded runs on feature branches, but never on main: that could stop a deploy halfway.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  UV_VERSION: "0.12.8"
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  lint-test:
+    name: Lint & test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: Install dependencies (locked)
+        run: uv sync --frozen --python ${{ env.PYTHON_VERSION }}
+
+      - name: Ruff lint
+        run: uv run ruff check . --output-format=github
+
+      - name: Ruff format check
+        run: uv run ruff format --check .
+
+      - name: Tests
+        env:
+          # Belt and braces: the test conftest already disables every external service.
+          LANGFUSE_ENABLED: "false"
+          LOGFIRE__ENABLED: "false"
+          GUARDRAILS__ENABLED: "false"
+          ONLINE_EVAL__ENABLED: "false"
+          REDIS__ENABLED: "false"
+          DEEPEVAL_TELEMETRY_OPT_OUT: "1"
+        run: uv run pytest -q
+
+  build-images:
+    name: Build images
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect Airflow changes
+        uses: dorny/paths-filter@v3
+        id: changes
+        with:
+          filters: |
+            airflow:
+              - 'airflow/**'
+
+      - name: Validate production compose file
+        run: |
+          touch .env deploy/.htpasswd   # compose requires the referenced files to exist
+          docker compose -f compose.yml -f compose.prod.yml config -q
+
+      - name: Build API image
+        run: docker build -t arxiv-rag-api:ci .
+
+      - name: Build UI image
+        run: docker build -t arxiv-rag-ui:ci -f ui/Dockerfile .
+
+      - name: Build Airflow image (only when airflow/ changed)
+        if: steps.changes.outputs.airflow == 'true'
+        run: docker build -t arxiv-rag-airflow:ci -f airflow/Dockerfile .
+
+      - name: API image starts and answers /ping
+        run: |
+          docker run -d --name api-ci -p 8000:8000 \
+            -e POSTGRES_DATABASE_URL=sqlite:// -e LANGFUSE_ENABLED=false -e LOGFIRE__ENABLED=false \
+            -e GUARDRAILS__ENABLED=false -e ONLINE_EVAL__ENABLED=false -e REDIS__ENABLED=false \
+            arxiv-rag-api:ci
+          for _ in $(seq 1 30); do
+            if curl -sf http://localhost:8000/api/v1/ping; then echo; exit 0; fi
+            sleep 2
+          done
+          docker logs api-ci
+          exit 1
+
+  deploy:
+    name: Deploy to EC2
+    needs: [lint-test, build-images]
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    environment:
+      name: production
+      url: http://${{ vars.EC2_HOST }}/
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false  # never interrupt a deploy halfway
+    env:
+      EC2_HOST: ${{ vars.EC2_HOST }}
+      EC2_USER: ubuntu
+      APP_DIR: /home/ubuntu/arxiv-rag
+      SG_ID: ${{ vars.EC2_SECURITY_GROUP_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check required secrets are set
+        env:
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          POSTGRES_DATABASE_URL: ${{ secrets.POSTGRES_DATABASE_URL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+          LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+          LOGFIRE__TOKEN: ${{ secrets.LOGFIRE__TOKEN }}
+          GUARDRAILS__ID: ${{ secrets.GUARDRAILS__ID }}
+          AIRFLOW_ADMIN_PASSWORD: ${{ secrets.AIRFLOW_ADMIN_PASSWORD }}
+          AIRFLOW_JWT_SECRET: ${{ secrets.AIRFLOW_JWT_SECRET }}
+          UI_PASSWORD: ${{ secrets.UI_PASSWORD }}
+        run: |
+          missing=()
+          for name in EC2_HOST SG_ID EC2_SSH_KEY AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY POSTGRES_DATABASE_URL \
+                      OPENAI_API_KEY LANGFUSE_PUBLIC_KEY LANGFUSE_SECRET_KEY LOGFIRE__TOKEN GUARDRAILS__ID \
+                      AIRFLOW_ADMIN_PASSWORD AIRFLOW_JWT_SECRET UI_PASSWORD; do
+            [ -n "${!name}" ] || missing+=("$name")
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Missing secrets/variables: ${missing[*]} (Settings -> Environments -> production)"
+            exit 1
+          fi
+          echo "All required secrets are set."
+
+      - name: Configure AWS credentials (only used to open/close SSH)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-2
+
+      - name: Open SSH for this runner only
+        id: sg
+        run: |
+          ip=$(curl -s https://checkip.amazonaws.com)
+          echo "runner_ip=$ip" >> "$GITHUB_OUTPUT"
+          aws ec2 authorize-security-group-ingress --group-id "$SG_ID" \
+            --ip-permissions "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=$ip/32,Description=github-actions-run-${{ github.run_id }}}]"
+          echo "SSH opened for $ip/32"
+
+      - name: Set up SSH key
+        env:
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          for _ in $(seq 1 12); do   # the new rule takes a few seconds to apply
+            ssh-keyscan -T 5 "$EC2_HOST" > ~/.ssh/known_hosts 2>/dev/null && [ -s ~/.ssh/known_hosts ] && break
+            sleep 5
+          done
+          [ -s ~/.ssh/known_hosts ] || { echo "::error::Cannot reach $EC2_HOST on port 22 (is the instance running?)"; exit 1; }
+          cat > ~/.ssh/config <<EOF
+          Host ec2
+            HostName $EC2_HOST
+            User $EC2_USER
+            IdentityFile ~/.ssh/deploy_key
+            UserKnownHostsFile ~/.ssh/known_hosts
+            BatchMode yes
+            ServerAliveInterval 30
+          EOF
+          chmod 600 ~/.ssh/config
+
+      - name: Render production .env (settings file + secrets)
+        env:
+          POSTGRES_DATABASE_URL: ${{ secrets.POSTGRES_DATABASE_URL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          JINA_API_KEY: ${{ secrets.JINA_API_KEY }}
+          LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+          LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+          LOGFIRE__TOKEN: ${{ secrets.LOGFIRE__TOKEN }}
+          GUARDRAILS__ID: ${{ secrets.GUARDRAILS__ID }}
+          AIRFLOW_ADMIN_PASSWORD: ${{ secrets.AIRFLOW_ADMIN_PASSWORD }}
+          AIRFLOW_JWT_SECRET: ${{ secrets.AIRFLOW_JWT_SECRET }}
+        run: |
+          umask 077
+          {
+            cat deploy/production.env
+            printf '\n# ---------- secrets (written by GitHub Actions run %s) ----------\n' "${{ github.run_id }}"
+            for name in POSTGRES_DATABASE_URL OPENAI_API_KEY JINA_API_KEY LANGFUSE_PUBLIC_KEY LANGFUSE_SECRET_KEY \
+                        LOGFIRE__TOKEN GUARDRAILS__ID AIRFLOW_ADMIN_PASSWORD AIRFLOW_JWT_SECRET; do
+              printf '%s=%s\n' "$name" "${!name}"
+            done
+          } > .env.incoming
+          echo "Rendered $(grep -c '=' .env.incoming) settings (values not shown)."
+
+      - name: Sync code and .env to the server
+        run: |
+          rsync -az --delete \
+            --exclude '.git/' --exclude '.env' --exclude 'deploy/.htpasswd' --exclude 'data/' \
+            --exclude '.venv/' --exclude 'eval_reports/' --exclude 'Claude outputs/' \
+            -e ssh ./ "ec2:$APP_DIR/"
+          rm -f .env.incoming   # don't leave secrets on the runner's disk
+
+      - name: Rebuild and restart on the server
+        env:
+          UI_PASSWORD: ${{ secrets.UI_PASSWORD }}
+        run: |
+          # APP_DIR is expanded here on the runner on purpose; the password goes over stdin, never argv.
+          # shellcheck disable=SC2029
+          printf '%s\n' "$UI_PASSWORD" | ssh ec2 "APP_DIR=$APP_DIR bash $APP_DIR/deploy/remote_deploy.sh"
+
+      - name: Smoke test the public URL
+        env:
+          UI_PASSWORD: ${{ secrets.UI_PASSWORD }}
+        run: |
+          base="http://$EC2_HOST"
+          test "$(curl -s -m 15 "$base/api/v1/ping")" = '{"message":"pong"}'
+          test "$(curl -s -o /dev/null -w '%{http_code}' -m 15 "$base/")" = "401"   # login still enforced
+          curl -sf -m 20 -u "arxiv:$UI_PASSWORD" "$base/api/v1/health" | tee /tmp/health.json
+          grep -q '"status":"ok"' /tmp/health.json
+          answer=$(curl -sf -m 120 -u "arxiv:$UI_PASSWORD" -X POST "$base/api/v1/ask" \
+            -H 'Content-Type: application/json' \
+            -d '{"query": "How many tasks does the FrontierPhysics benchmark contain?", "top_k": 3}')
+          echo "$answer" | python3 -c "import sys, json; d = json.load(sys.stdin); print('answer:', d['answer'][:200]); assert '56' in d['answer'], 'unexpected answer'"
+
+      - name: Close SSH again
+        if: always() && steps.sg.outputs.runner_ip != ''
+        run: |
+          aws ec2 revoke-security-group-ingress --group-id "$SG_ID" \
+            --ip-permissions "IpProtocol=tcp,FromPort=22,ToPort=22,IpRanges=[{CidrIp=${{ steps.sg.outputs.runner_ip }}/32}]" \
+            && echo "SSH closed for ${{ steps.sg.outputs.runner_ip }}/32"
+          rm -f ~/.ssh/deploy_key

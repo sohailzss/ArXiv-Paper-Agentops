@@ -1,0 +1,11 @@
+.venv
+.git
+.env
+data
+notebooks
+tests
+**/__pycache__
+.pytest_cache
+.ruff_cache
+deploy/.htpasswd
+.venv

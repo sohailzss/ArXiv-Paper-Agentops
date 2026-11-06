@@ -1,0 +1,36 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Data and caches
+data/*
+!data/.gitkeep
+*.pdf
+logs/
+
+# Editors / OS
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+
+# Deployment secrets
+deploy/.htpasswd
+
+# Golden dataset is source, not data
+!data/golden_dataset.json
+# Evaluation reports
+eval_reports/
+Claude outputs/

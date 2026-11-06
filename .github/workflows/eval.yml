@@ -1,0 +1,80 @@
+# Runs the 25 golden questions against production with DeepEval metrics and fails if any threshold in
+# data/golden_dataset.json is missed. Weekly (after the ingestion DAG has added new papers) and on demand.
+# Not run on every deploy: a full run costs ~$1-2 of judge calls; the deploy job runs a cheap smoke test.
+
+name: Evaluation
+
+on:
+  schedule:
+    - cron: "0 9 * * 1"  # Mondays 09:00 UTC
+  workflow_dispatch:
+    inputs:
+      ids:
+        description: "Golden ids to run, comma-separated (empty = all 25)"
+        required: false
+        default: ""
+      mode:
+        description: "Endpoint to evaluate"
+        type: choice
+        options: [agent, rag]
+        default: agent
+      judge:
+        description: "Run DeepEval's LLM-judged metrics (costs judge calls)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: evaluation
+  cancel-in-progress: false
+
+jobs:
+  evaluate:
+    name: Golden evaluation
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.8"
+          enable-cache: true
+
+      - name: Install dependencies (locked)
+        run: uv sync --frozen --python 3.12
+
+      - name: Run evaluation with gate
+        env:
+          EVAL_BASE_URL: http://${{ vars.EC2_HOST }}
+          EVAL_AUTH: arxiv:${{ secrets.UI_PASSWORD }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}  # DeepEval judge
+          DEEPEVAL_TELEMETRY_OPT_OUT: "1"
+          LOGFIRE__ENABLED: "false"
+          IDS: ${{ inputs.ids }}
+          MODE: ${{ inputs.mode || 'agent' }}
+          JUDGE: ${{ inputs.judge == false && 'false' || 'true' }}
+        run: |
+          args=(--mode "$MODE" --gate)
+          [ -n "$IDS" ] && args+=(--ids "$IDS")
+          [ "$JUDGE" = "false" ] && args+=(--no-judge)
+          uv run python scripts/run_eval.py "${args[@]}"
+
+      - name: Add report to the run summary
+        if: always()
+        run: |
+          # Report names are timestamped (eval_<mode>_<YYYYmmdd_HHMMSS>.md), so the newest sorts last.
+          report=$(find eval_reports -name '*.md' 2>/dev/null | sort | tail -1)
+          if [ -n "$report" ]; then cat "$report" >> "$GITHUB_STEP_SUMMARY"; else echo "No report produced." >> "$GITHUB_STEP_SUMMARY"; fi
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report-${{ github.run_id }}
+          path: eval_reports/
+          if-no-files-found: ignore
+          retention-days: 90
